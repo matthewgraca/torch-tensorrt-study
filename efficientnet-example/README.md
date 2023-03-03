@@ -83,7 +83,9 @@ $ wget  -O ./data/img2.JPG "https://www.artis.nl/media/filer_public_thumbnails/f
 $ wget  -O ./data/img3.JPG "https://www.familyhandyman.com/wp-content/uploads/2018/09/How-to-Avoid-Snakes-Slithering-Up-Your-Toilet-shutterstock_780480850.jpg"
 ```
 
-Another important file we'll download is the set of labels for imagenet:
+Another important file we'll download is the set of labels for imagenet, which contains data that 
+maps a number (as a string) to a pair, containing an identification string and the name of the 
+object associated with that string.
 
 ```bash
 $ wget  -O ./data/imagenet_class_index.json "https://s3.amazonaws.com/deep-learning-models/image-models/imagenet_class_index.json"
@@ -121,7 +123,9 @@ Here we are getting the image, transforming the image to our desired form, showi
 and converting them to tensors for our model. More on the Compose class can be found here. 
 [[3]](https://pytorch.org/vision/main/generated/torchvision.transforms.Compose.html)
 
-Finally, we'll load the labels.
+Finally, we'll store the labels in a dictionary, mapping an index to a pair containing an 
+identification string and the object associated with that string, formatted like so: 
+`"86": ["n01807496", "partridge"]`.
 
 ```python
 with open("./data/imagenet_class_index.json") as json_file:
@@ -155,3 +159,98 @@ def efficientnet_preprocess():
     transform = create_transform(**config)
     return transform
 ```
+
+### `predict()`
+This function is responsible for making the actual prediction.
+
+```python
+# decode the results into ([predicted class, description], probability)
+def predict(img_path, model):
+    img = Image.open(img_path)
+    preprocess = efficientnet_preprocess()
+    input_tensor = preprocess(img)
+    input_batch = input_tensor.unsqueeze(0) # create a mini-batch as expected by the model
+
+    # move the input and model to GPU for speed if available
+    if torch.cuda.is_available():
+        input_batch = input_batch.to('cuda')
+        model.to('cuda')
+
+    with torch.no_grad():
+        output = model(input_batch)
+        # Tensor of shape 1000, with confidence scores over Imagenet's 1000 classes
+        sm_output = torch.nn.functional.softmax(output[0], dim=0)
+
+    ind = torch.argmax(sm_output)
+    return d[str(ind.item())], sm_output[ind] #([predicted class, description], probability)
+```
+
+Let's analyze the first block of code. The image to predict is opened, preprocessed, converted into 
+a `(224, 224, 3)` tensor. 
+
+However, efficientnet requires its inputs to also have an extra dimension for batch size, so it is 
+expecting a tensor of the shape `(N, 224, 224, 3)`, where `N` is the batch size. 
+[[6]](https://github.com/lukemelas/EfficientNet-PyTorch/issues/174)
+By using `tensor.unsqueeze(0)`, we are adding another dimension to `input_tensor` at position `0`.
+[[7]](https://stackoverflow.com/a/65831759)
+
+Next, let's take a look at the second block of code. Recall that we moved the model to the GPU; 
+here we move both the data and model to ensure both are on the GPU and neither is on the CPU.
+
+Now, for the third block of code. We mark the model to ensure gradient calculations are not being 
+made. We don't care about those since we are doing no training, only inference. We then pass the 
+input we want to infer about throught the model. The model will return a tensor of numerical values 
+of shape 1000, as there are 1000 classes defined in Imagenet's database. To make sense of these 
+numbers, we further modify this tensor by converting this tensor of numbers into a tensor of 
+probabilities (or confidences) with the softmax function.
+
+You'll notice we used `output[0]`; this is because strictly speaking, our tensor is not 
+one-dimensional. In particular, `model(input_batch) returns a tensor of the shape `(1, 1000)`. 
+
+The fourth and final block of code gets the index of the largest value in the softmax tensor, 
+which is the label with the highest probability. This is a tensor with one value, so we use 
+`torch.tensor.item()` to convert tensors with one item to a standard Python number. Using 
+the dictionary of labels we initialized earlier, we can map this index number to a particular 
+object in one of our 1000 classes.
+
+### `benchmark()`
+
+This function is responsible for performing our benchmarks.
+
+```python
+def benchmark(model, input_shape=(1024, 1, 224, 224), dtype='fp32', nwarmup=50, nruns=10000):
+    input_data = torch.randn(input_shape)
+    input_data = input_data.to("cuda")
+    if dtype=='fp16':
+        input_data = input_data.half()
+
+    print("Warm up ...")
+    with torch.no_grad():
+        for _ in range(nwarmup):
+            features = model(input_data)
+    torch.cuda.synchronize()
+    print("Start timing ...")
+    timings = []
+    with torch.no_grad():
+        for i in range(1, nruns+1):
+            start_time = time.time()
+            features = model(input_data)
+            torch.cuda.synchronize()
+            end_time = time.time()
+            timings.append(end_time - start_time)
+            if i%10==0:
+                print('Iteration %d/%d, avg batch time %.2f ms'%(i, nruns, np.mean(timings)*1000))
+
+    print("Input shape:", input_data.size())
+    print("Output features size:", features.size())
+    print('Average throughput: %.2f images/second'%(input_shape[0]/np.mean(timings)))
+```
+
+Let's begin with the first block. We start by making our input data a tensor of random numbers 
+in the shape of a tensor that the model will accept. The point is to test performance, so 
+we don't care if these are "real" pictures - this will help us test performance without being 
+bogged down downloading and converting pictures to our required format for input. We shuffle 
+that data into our GPU, and check the data type we are passing in. We'll discuss more about 
+this function and how it relates to TensorRT later; just know that we can run models with 
+different precisions.
+
