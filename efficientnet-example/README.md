@@ -4,7 +4,8 @@ These are notes for learning Torch-TensorRT. I'm going through the Jupyter Noteb
 [this](https://github.com/pytorch/TensorRT/tree/main/notebooks) repo.
 
 The goal for this particular notebook is to understand how Torch-TensorRT can be used 
-with 3rd party, pre-trained models.
+with 3rd party, pre-trained models; the official walkthrough can be found 
+[here](https://github.com/pytorch/TensorRT/blob/main/notebooks/EfficientNet-example.ipynb).
 
 Torch-TensorRT does two major optimizations:
 - Fuses layers and tensors in the model graph, using a large kernel library to pick 
@@ -132,9 +133,12 @@ with open("./data/imagenet_class_index.json") as json_file:
     d = json.load(json_file)
 ```
 
-## Utility Functions
+# Utility Functions
+
 Before we continue, we'll define some utility functions that we'll use to preprocess, predict, 
 and conduct our benchmarks. After defining these, we'll test them out on our sample.
+
+## Utility Function Definitions
 
 First, we go into benchmark mode. This is useful when our input sizes don't change, and what we 
 get out of it is `cudnn` will look for the optimal set of algorithms for our particular 
@@ -254,3 +258,189 @@ that data into our GPU, and check the data type we are passing in. We'll discuss
 this function and how it relates to TensorRT later; just know that we can run models with 
 different precisions.
 
+Next, we have to "warm up" our model. As it turns out, the first few inferences that are made 
+are significantly slower than the subsequent inferences that are made because the model defers 
+initializations and optimizations until its first few inference requests. 
+[[8]](https://medium.com/log-loss/model-warmup-8e9681ef4d41) Again, we mark the model to not 
+automatically make gradient calculations since we are just doing inference. We warm up the model 
+with a default number of passes, with `nwarmup=50` in this case. Furthermore, 
+`torch.cuda.synchronize()` prevens the CPU thread from proceeding until all inference is 
+completed. [[9]](https://auro-227.medium.com/timing-your-pytorch-code-fragments-e1a556e81f2) 
+
+After warmup is completed, we start the benchmark for actual inference runs. Mark the tensors 
+to ensure no gradients are being calculated, then infer what is `input_data` `nrun` times. 
+For example, our default `input_shape=(1024, 1, 224, 224)` with `nruns=10000`. That means by 
+default we would be making inferences on 1024 images per run; so 10,240,000 total inferences. 
+In reality, our tests will be much less rigorous and use smaller shapes and runs. Moving on, 
+ensure to capture the time it takes to make each inference, and synchronize the cuda device 
+to ensure the serial portion of the code is not continuing before all inference per run is complete. 
+Finally, output data on performance after every 10th iteration.
+
+The last set of print statements just show the shape of the input, the shape of the output, 
+and the average number of images that complete inference per second.
+
+## Testing `predict()` on the Sample
+
+Here, we'll show off the utility functions on our sample.
+
+```python
+for i in range(4):
+    img_path = './data/img%d.JPG'%i
+    img = Image.open(img_path)
+
+    pred, prob = predict(img_path, efficientnet_b0_model)
+    print('{} - Predicted: {}, Probablility: {}'.format(img_path, pred, prob))
+
+    plt.subplot(2,2,i+1)
+    plt.imshow(img);
+    plt.axis('off');
+    plt.title(pred[1])
+```
+
+In this snippet, we give `predict` a path to the image and the model we're using, giving us a 
+dictionary with the predicted class and description, and the probability of the image matching 
+the best prediction the model made.
+
+# Benchmarks
+
+Here, we'll perform the benchmarks without Torch-TensorRT. Then we'll use Torch-TensorRT in FP32 
+precision mode, and in FP16 precision mode, and compare the results of the benchmark.
+
+Each benchmark will have an `input_shape=(128, 3, 224, 224)`, so essentially 128 RGB images being 
+inferred per run, with `nruns=100`.
+
+## Without Torch-TensorRT
+
+To benchmark this, we simply pass in the model unmodified into `benchmark()` along with our 
+agreed input shape and number of runs.
+
+```python
+# Model benchmark without Torch-TensorRT
+benchmark(model, input_shape=(128, 3, 224, 224), nruns=100)
+```
+
+And would produce output similar to this:
+```
+Warm up ...
+Start timing ...
+Iteration 10/100, avg batch time 37.62 ms
+Iteration 20/100, avg batch time 37.66 ms
+Iteration 30/100, avg batch time 37.65 ms
+Iteration 40/100, avg batch time 37.66 ms
+Iteration 50/100, avg batch time 37.70 ms
+Iteration 60/100, avg batch time 37.70 ms
+Iteration 70/100, avg batch time 37.70 ms
+Iteration 80/100, avg batch time 37.71 ms
+Iteration 90/100, avg batch time 37.72 ms
+Iteration 100/100, avg batch time 37.72 ms
+Input shape: torch.Size([128, 3, 224, 224])
+Output features size: torch.Size([128, 1000])
+Average throughput: 3393.46 images/second
+```
+
+## With Torch-TensorRT: FP32 (Single Precision)
+
+To accelerate our inference, we need to make various changes to the model that we currently have. 
+Since our tensors are already in FP32 format, this is a demonstration of only the layer and tensor 
+fusions in the model graph, and the kernel library's best implementations for the target GPU.
+
+What is of note is the simplicity of use - one function converts a model to the necessary format; 
+in this case, `torch_tensorrt.compile()`. This returns a compiled PyTorch module that will execute 
+via TensorRT when run. It takes in the model to compile, the input shape and data type, what 
+precision TensorRT can use when selecting kernels. Another argument is the workspace size for 
+TensorRT; I don't know much about this other than the fact that it's an int and `1 << 22 = 4194304`.
+[[10]](https://pytorch.org/TensorRT/py_api/torch_tensorrt.html#torch-tensorrt-py)
+
+```python
+# The compiled module will have precision as specified by "op_precision".
+# Here, it will have FP32 precision.
+trt_model_fp32 = torch_tensorrt.compile(model, inputs = [torch_tensorrt.Input((128, 3, 224, 224), dtype=torch.float32)],
+    enabled_precisions = torch.float32, # Run with FP32
+    workspace_size = 1 << 22
+)
+```
+
+When benchmarking, the code is the same, except for the model passed through:
+
+```python
+# Obtain the average time taken by a batch of input
+benchmark(trt_model_fp32, input_shape=(128, 3, 224, 224), nruns=100)
+```
+
+The output should look like this:
+
+```
+Warm up ...
+Start timing ...
+Iteration 10/100, avg batch time 27.86 ms
+Iteration 20/100, avg batch time 27.71 ms
+Iteration 30/100, avg batch time 27.99 ms
+Iteration 40/100, avg batch time 27.95 ms
+Iteration 50/100, avg batch time 27.89 ms
+Iteration 60/100, avg batch time 27.85 ms
+Iteration 70/100, avg batch time 28.00 ms
+Iteration 80/100, avg batch time 27.97 ms
+Iteration 90/100, avg batch time 27.95 ms
+Iteration 100/100, avg batch time 27.92 ms
+Input shape: torch.Size([128, 3, 224, 224])
+Output features size: torch.Size([128, 1000])
+Average throughput: 4584.06 images/second
+```
+
+## With Torch-TensorRT: FP16 (Half Precision)
+
+Again, we'll compile the model to work with TensorRT - but this time, with the data type to be set 
+to half precision:
+
+```python
+# The compiled module will have precision as specified by "op_precision".
+# Here, it will have FP16 precision.
+trt_model_fp16 = torch_tensorrt.compile(model, inputs = [torch_tensorrt.Input((128, 3, 224, 224), dtype=torch.half)],
+    enabled_precisions = {torch.half}, # Run with FP16
+    workspace_size = 1 << 22
+)
+```
+
+We'll then run the benchmark:
+
+```python
+# Obtain the average time taken by a batch of input
+benchmark(trt_model_fp16, input_shape=(128, 3, 224, 224), dtype='fp16', nruns=100)
+```
+
+Before analyzing the output, recall that `benchmark()` had a special condition for data types at 
+FP16:
+```python
+    if dtype=='fp16':
+        input_data = input_data.half()
+```
+
+This function converts the data type of our input tensors from `torch.float32` to `torch.float16`. 
+[[11]](https://pytorch.org/docs/stable/generated/torch.Tensor.half.html)
+
+Back the output of our benchmark, we should have:
+```
+Warm up ...
+Start timing ...
+Iteration 10/100, avg batch time 12.05 ms
+Iteration 20/100, avg batch time 12.56 ms
+Iteration 30/100, avg batch time 12.39 ms
+Iteration 40/100, avg batch time 12.34 ms
+Iteration 50/100, avg batch time 12.33 ms
+Iteration 60/100, avg batch time 12.32 ms
+Iteration 70/100, avg batch time 12.30 ms
+Iteration 80/100, avg batch time 12.28 ms
+Iteration 90/100, avg batch time 12.35 ms
+Iteration 100/100, avg batch time 12.35 ms
+Input shape: torch.Size([128, 3, 224, 224])
+Output features size: torch.Size([128, 1000])
+Average throughput: 10362.23 images/second
+```
+
+# Conclusion
+
+We've taken a look at how we can grab a pretrained model, recompile that module into a module 
+executed by TensorRT, and benchmarked the performance improvements that were made as a result. 
+Of particular note is the ease in which the conversion was possible - one function to compile 
+a module was all that was needed for FP32, and while compilation only needed one line for FP16, 
+we needed to add an additional condition to change the input tensors from FP32 to FP16 as well.
